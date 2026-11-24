@@ -42,6 +42,7 @@ return function(window)
         QuestCache = nil,
         Catalog = nil,
         QuestNpc = {},
+        StartedKey = nil,
         LastBuso = 0,
         LastRadius = 0,
         LastClear = 0,
@@ -162,6 +163,7 @@ return function(window)
     local levelLabel = farmTab:AddLabel("Nível: 0")
     local questLabel = farmTab:AddLabel("Missão: aguardando")
     local nextLabel = farmTab:AddLabel("Próxima: nenhuma")
+    local activeLabel = farmTab:AddLabel("Quest ativa: não")
     local stateLabel = farmTab:AddLabel("Estado: parado")
 
     local fruitTab = window:AddTab("Frutas")
@@ -234,9 +236,18 @@ return function(window)
         local origin = Workspace:FindFirstChild("_WorldOrigin")
         local folder = origin and origin:FindFirstChild("EnemySpawns")
         if folder then
-            for _, spawn in ipairs(folder:GetChildren()) do
+            local children = folder:GetChildren()
+            for _, spawn in ipairs(children) do
                 if spawn:IsA("PVInstance") and nameMatches(spawn.Name, mob) then
                     table.insert(list, spawn:GetPivot().Position)
+                end
+            end
+            if #list == 0 then
+                local needle = mob:lower()
+                for _, spawn in ipairs(children) do
+                    if spawn:IsA("PVInstance") and spawn.Name:lower():find(needle, 1, true) then
+                        table.insert(list, spawn:GetPivot().Position)
+                    end
                 end
             end
         end
@@ -302,7 +313,8 @@ return function(window)
                                             index = index,
                                             mob = mob,
                                             level = required,
-                                            source = "módulo"
+                                            source = "módulo",
+                                            data = data
                                         })
                                     end
                                 end
@@ -337,20 +349,53 @@ return function(window)
         return entries
     end
 
+    local function seaOfLevel(level)
+        return level >= 1500 and 3 or level >= 700 and 2 or 1
+    end
+
+    local function entryDistance(entry)
+        local root = getRoot()
+        local positions = findSpawnPositions(entry.mob)
+        if not root or #positions == 0 then
+            return math.huge
+        end
+        local best = math.huge
+        for _, position in ipairs(positions) do
+            best = math.min(best, (position - root.Position).Magnitude)
+        end
+        return best
+    end
+
     local function selectFrom(entries, level)
-        local current = nil
-        local following = nil
-        for position = #entries, 1, -1 do
-            local entry = entries[position]
-            if entry.level <= level and mobAvailable(entry.mob) then
-                current = entry
-                break
+        local sea = getSea(level)
+        local topLevel = nil
+        for _, entry in ipairs(entries) do
+            if seaOfLevel(entry.level) == sea and entry.level <= level then
+                if not topLevel or entry.level > topLevel then
+                    topLevel = entry.level
+                end
             end
         end
+        local current = nil
+        local bestDistance = math.huge
+        if topLevel then
+            for _, entry in ipairs(entries) do
+                if entry.level == topLevel and seaOfLevel(entry.level) == sea then
+                    local distance = entryDistance(entry)
+                    if not current or distance < bestDistance then
+                        current = entry
+                        bestDistance = distance
+                    end
+                end
+            end
+        end
+        local following = nil
         for _, entry in ipairs(entries) do
-            if entry.level > level and (not current or entry.mob ~= current.mob) and mobAvailable(entry.mob) then
-                following = entry
-                break
+            if seaOfLevel(entry.level) == sea and entry.level > level then
+                if not current or entry.mob ~= current.mob then
+                    following = entry
+                    break
+                end
             end
         end
         return current, following
@@ -362,27 +407,14 @@ return function(window)
             return cache.current, cache.following
         end
         local current, following = selectFrom(buildCatalog(), level)
-        local expires = math.huge
         if not current then
-            local entries = contingencyEntries(level)
-            local fallbackCurrent, fallbackFollowing = selectFrom(entries, level)
-            if not fallbackCurrent then
-                for _, entry in ipairs(entries) do
-                    if entry.level <= level then
-                        fallbackCurrent = entry
-                    end
-                end
-                fallbackCurrent = fallbackCurrent or entries[1]
-            end
-            current = fallbackCurrent
-            following = following or fallbackFollowing
-            expires = os.clock() + 10
+            current, following = selectFrom(contingencyEntries(level), level)
         end
         State.QuestCache = {
             level = level,
             current = current,
             following = following,
-            expires = expires
+            expires = os.clock() + 30
         }
         return current, following
     end
@@ -466,32 +498,99 @@ return function(window)
 
     loadQuestMap()
 
+    local function titleMatches(title, mob)
+        local text = title:lower()
+        local name = mob:lower()
+        if text:find(name, 1, true) then
+            return true
+        end
+        for cut = 1, 3 do
+            if #name - cut >= 4 and text:find(name:sub(1, #name - cut), 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function questKey(info)
+        return tostring(info.quest) .. ":" .. tostring(info.index)
+    end
+
     local function questStarted(info)
         if not questActive() then
             return false
         end
-        local title = questTitle():lower()
-        return title == "" or title:find(info.mob:lower(), 1, true) ~= nil
+        if State.StartedKey == questKey(info) then
+            return true
+        end
+        local title = questTitle()
+        return title == "" or titleMatches(title, info.mob)
     end
 
-    local function tryStart(info)
-        invoke("StartQuest", info.quest, info.index)
-        task.wait(0.5)
-        return questStarted(info)
+    local function tryStart(info, attempts)
+        for _ = 1, attempts do
+            invoke("StartQuest", info.quest, info.index)
+            task.wait(0.6)
+            if questActive() then
+                State.StartedKey = questKey(info)
+                return true
+            end
+        end
+        return false
     end
 
-    local function rankNpcs(reference)
-        local containers = {}
+    local function npcContainers()
+        local list = {}
         local live = Workspace:FindFirstChild("NPCs")
         local stored = ReplicatedStorage:FindFirstChild("NPCs")
         if live then
-            table.insert(containers, live)
+            table.insert(list, live)
         end
         if stored then
-            table.insert(containers, stored)
+            table.insert(list, stored)
         end
+        return list
+    end
+
+    local function findNamedNpc(info)
+        if type(info.data) ~= "table" then
+            return nil
+        end
+        local names = {}
+        for _, container in ipairs(npcContainers()) do
+            for _, npc in ipairs(container:GetChildren()) do
+                if npc:IsA("Model") then
+                    names[npc.Name] = npc
+                end
+            end
+        end
+        local function scan(value, depth)
+            if type(value) == "string" and names[value] then
+                return names[value]
+            end
+            if type(value) == "table" and depth < 3 then
+                for _, inner in pairs(value) do
+                    local found = scan(inner, depth + 1)
+                    if found then
+                        return found
+                    end
+                end
+            end
+            return nil
+        end
+        local npc = scan(info.data, 0)
+        if not npc then
+            return nil
+        end
+        local ok, pivot = pcall(function()
+            return npc:GetPivot()
+        end)
+        return ok and pivot.Position or nil
+    end
+
+    local function rankNpcs(reference)
         local ranked = {}
-        for _, container in ipairs(containers) do
+        for _, container in ipairs(npcContainers()) do
             for _, npc in ipairs(container:GetChildren()) do
                 if npc:IsA("Model") then
                     local ok, pivot = pcall(function()
@@ -531,16 +630,25 @@ return function(window)
         if not reference then
             return false
         end
-        local ranked = rankNpcs(reference)
-        local limit = math.min(#ranked, Config.ProbeLimit)
-        for position = 1, limit do
+        local targets = {}
+        local named = findNamedNpc(info)
+        if named then
+            table.insert(targets, named)
+        end
+        for _, entry in ipairs(rankNpcs(reference)) do
+            if #targets >= Config.ProbeLimit then
+                break
+            end
+            table.insert(targets, entry.position)
+        end
+        for position, target in ipairs(targets) do
             if not farmAlive() then
                 return false
             end
-            stateLabel:Set(string.format("Estado: detectando NPC (%d/%d)", position, limit))
-            if travel(CFrame.new(ranked[position].position + Vector3.new(0, 3, 0)), farmAlive) then
-                task.wait(0.3)
-                if tryStart(info) then
+            stateLabel:Set(string.format("Estado: detectando NPC (%d/%d)", position, #targets))
+            if travel(CFrame.new(target + Vector3.new(0, 3, 0)), farmAlive) then
+                task.wait(0.4)
+                if tryStart(info, 2) then
                     local current = getRoot()
                     if current then
                         State.QuestNpc[info.quest] = current.Position
@@ -560,19 +668,28 @@ return function(window)
         State.Combat = false
         if questActive() then
             invoke("AbandonQuest")
-            task.wait(0.4)
-        end
-        if tryStart(info) then
-            return true
+            State.StartedKey = nil
+            for _ = 1, 10 do
+                if not questActive() then
+                    break
+                end
+                task.wait(0.2)
+            end
+            if questActive() then
+                return false
+            end
         end
         local known = State.QuestNpc[info.quest]
         if known then
-            stateLabel:Set("Estado: indo ao NPC aprendido")
-            if travel(CFrame.new(known), farmAlive) and tryStart(info) then
+            stateLabel:Set("Estado: indo ao NPC da quest")
+            if travel(CFrame.new(known), farmAlive) and tryStart(info, 2) then
                 return true
             end
             State.QuestNpc[info.quest] = nil
             saveQuestMap()
+        end
+        if tryStart(info, 1) then
+            return true
         end
         return discoverQuestNpc(info, spawns)
     end
@@ -697,6 +814,7 @@ return function(window)
             return
         end
         questLabel:Set(string.format("%s [%d] | %s (%s)", info.quest, info.index, info.mob, info.source))
+        activeLabel:Set(string.format("Quest ativa: %s | %s", questActive() and "sim" or "não", questTitle()))
         if following then
             nextLabel:Set(string.format(
                 "Próxima: %s (nível %d) | local %s",
@@ -971,6 +1089,16 @@ return function(window)
     end)
     farmTab:AddTextbox("Nome da arma", "opcional", "", function(text)
         Config.WeaponName = text
+    end)
+
+    farmTab:AddButton("Gravar NPC da quest aqui", function()
+        local root = getRoot()
+        local info = resolveQuest(getLevel())
+        if root and info then
+            State.QuestNpc[info.quest] = root.Position
+            saveQuestMap()
+            stateLabel:Set("Estado: NPC gravado para " .. info.quest)
+        end
     end)
 
     local fruitToggle = fruitTab:AddToggle("Coletar e guardar frutas", false, function(value)
